@@ -1,77 +1,135 @@
-#include<iostream>
-#include<WinSock2.h>
-using namespace std;
-#pragma comment(lib,"ws2_32.lib")
+#include <stdio.h>
+#include <time.h>
 
-int main()
+#include <event2/bufferevent.h>
+#include <event2/buffer.h>
+#include <event2/listener.h>
+#include <event2/util.h>
+#include <event2/event.h>
+
+const int PORT = 2500;
+const int BUFFER_SIZE = 1024;
+
+void listener_cb(struct evconnlistener *, evutil_socket_t,
+                 struct sockaddr *, int socklen, void *);
+void conn_writecb(struct bufferevent *, void *);
+void conn_readcb(struct bufferevent *, void *);
+void conn_eventcb(struct bufferevent *, short, void *);
+void delay(int ms);
+
+int main(int argc, char **argv)
 {
-    //初始化WSA
-    WORD sockVersion=MAKEWORD(2,2);
-    WSADATA wsaData;//WSADATA结构体变量的地址值
-
-    //int WSAStartup(WORD wVersionRequested, LPWSADATA lpWSAData);
-    //成功时会返回0，失败时返回非零的错误代码值
-    if(WSAStartup(sockVersion,&wsaData)!=0)
-    {
-        cout<<"WSAStartup() error!"<<endl;
-        return 0;
-    }
-
-    //创建套接字
-    SOCKET slisten=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);
-    if(slisten==INVALID_SOCKET)
-    {
-        cout<<"socket error !"<<endl;
-        return 0;
-    }
-
-    //绑定IP和端口
-    sockaddr_in sin;//ipv4的指定方法是使用struct sockaddr_in类型的变量
+    printf("I am server\n");
+#ifdef WIN32
+    WSAData wsaData;
+    WSAStartup(MAKEWORD(2, 0), &wsaData);
+#endif
+    struct sockaddr_in sin;
+    memset(&sin, 0, sizeof(sin));
     sin.sin_family = AF_INET;
-    sin.sin_port = htons(8888);//设置端口。htons将主机的unsigned short int转换为网络字节顺序
-    sin.sin_addr.S_un.S_addr = INADDR_ANY;//IP地址设置成INADDR_ANY，让系统自动获取本机的IP地址
-    //bind函数把一个地址族中的特定地址赋给scket。
-    if(bind(slisten, (LPSOCKADDR)&sin, sizeof(sin)) == SOCKET_ERROR)
+    sin.sin_port = htons(PORT);
+    sin.sin_addr.S_un.S_addr = INADDR_ANY;
+
+    struct evconnlistener *listener;
+    struct event_base *base = event_base_new();
+    if (!base)
     {
-        printf("bind error !");
+        printf("Could not initialize libevent\n");
+        return 1;
+    }
+    listener = evconnlistener_new_bind(base, listener_cb, (void *)base,
+        LEV_OPT_REUSEABLE|LEV_OPT_CLOSE_ON_FREE, -1,
+        (struct sockaddr*)&sin,
+        sizeof(sin));
+
+    if (!listener)
+    {
+        printf("Could not create a listener\n");
+        return 1;
     }
 
-    //开始监听
-    if(listen(slisten,5)==SOCKET_ERROR)
+    event_base_dispatch(base);
+    evconnlistener_free(listener);
+    event_base_free(base);
+
+    printf("done\n");
+    return 0;
+}
+
+void listener_cb(struct evconnlistener *listener, evutil_socket_t fd,
+                 struct sockaddr *sa, int socklen, void *user_data)
+{
+    printf("Detect an connection\n");
+    struct event_base *base = (struct event_base *)user_data;
+    struct bufferevent *bev;
+
+    bev = bufferevent_socket_new(base, fd, BEV_OPT_CLOSE_ON_FREE);
+    if (!bev)
     {
-        cout<<"listen error !"<<endl;
-        return -1;
+        printf("Could not create a bufferevent\n");
+        event_base_loopbreak(base);
+        return;
+    }
+    bufferevent_setcb(bev, conn_readcb, conn_writecb, conn_eventcb, NULL);
+    bufferevent_enable(bev, EV_READ|EV_WRITE);
+    //服务器监听到连接时，给客户端发送第一条消息
+    const char *reply_msg = "I receive a message from server";
+    bufferevent_write(bev, reply_msg, strlen(reply_msg));
+}
+
+//conn_writecwritecb函数将在bufferevent中的output evbuffer缓冲区发送完成后被调用。
+//此时evbuffer_get_length(output) = 0，说明output evbuffer缓冲区被清空。
+//假设发现有10000条记录要发送出去，1次发送10000条将占用大量内存，所以，我们要分批发送
+//先发送100条数据，假设每条数据为1024字节bufferevent_write(bev,buf,1024 *100);
+//系统在这100条记录发送完成后将调用conn_writecbb回调函数,然后在该函数中循环发送剩下的
+//数据
+void conn_writecb(struct bufferevent *bev, void *user_data)
+{
+//    struct evbuffer *output = bufferevent_get_output(bev);
+//    if (evbuffer_get_length(output) == 0)
+//    {
+//        printf("Output evbuffer is flushed\n");
+//        bufferevent_free(bev);
+//    }
+    //delay 1 second
+    delay(1000);
+    static int msg_num = 1;
+    char reply_msg[1000] = {'\0'};
+    const char *str = "I receive a message from server ";
+    memcpy(reply_msg,str,strlen(str));
+    sprintf(reply_msg+strlen(str),"%d",msg_num);
+    bufferevent_write(bev, reply_msg, strlen(reply_msg));
+    msg_num++;
+}
+
+void conn_readcb(struct bufferevent *bev, void *user_data)
+{
+    struct evbuffer *input =bufferevent_get_input(bev);
+    size_t sz=evbuffer_get_length(input);
+    if (sz > 0)
+    {
+        char msg[BUFFER_SIZE] = {'\0'};
+        bufferevent_read(bev, msg, sz);
+        printf("%s\n", msg);
+    }
+}
+
+void conn_eventcb(struct bufferevent *bev, short events, void *user_data)
+{
+    if (events & BEV_EVENT_EOF)
+    {
+        printf("Connection closed\n");
+    }
+    else if (events & BEV_EVENT_ERROR)
+    {
+        printf("Got an error on the connection: %s\n",strerror(errno));
     }
 
-    //循环接收数据
-    SOCKET sclient;
-    sockaddr_in remoteAddr;//sockaddr_in常用于socket定义和赋值,sockaddr用于函数参数
-    int nAddrlen=sizeof(remoteAddr);
-    char revData[255];
-    while(true)
-    {
-        cout<<"wait to connect..."<<endl;
-        sclient=accept(slisten,(sockaddr *)&remoteAddr,&nAddrlen);
-        if(sclient==INVALID_SOCKET)
-        {
-            cout<<"accept error !"<<endl;
-            continue;
-        }
-        cout<<"accepted a connection..."<<inet_ntoa(remoteAddr.sin_addr)<<endl;
-        //接收数据
-//        int ret=recv(sclient,revData,255,0);
-//        if(ret>0)
-//        {
-//            revData[ret]=0x00;
-//            cout<<revData<<endl;
-//        }
-        //发送数据
-        const char * sendData = "你好，TCP客户端！\n";
-        send(sclient, sendData, strlen(sendData), 0);
-        closesocket(sclient);
-    }
-    closesocket(slisten);
-    WSACleanup();
-    system("pause");
-    //return 0;
+    bufferevent_free(bev);
+}
+
+void delay(int ms)
+{
+   clock_t start = clock();
+   while(clock() - start < ms);
 }
